@@ -1,0 +1,164 @@
+name: Compilar AbogaRed iOS (.ipa) Gratis
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Publicar archivo .ipa en GitHub Releases"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Generar AbogaRed.ipa (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Descargar código fuente
+        uses: actions/checkout@v4
+
+      - name: Instalar XcodeGen y generar AbogaRed.xcodeproj
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Mostrar versión de Xcode y SDK
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep iphone
+
+      - name: Detectar configuración de firma Apple (opcional)
+        id: signing
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERT_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROFILE_B64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$CERT_B64" ] && [ -n "$CERT_PASS" ] && [ -n "$PROFILE_B64" ] && [ -n "$TEAM_ID" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compilar AbogaRed-unsigned.ipa (Modo 100% gratis sin cuenta Apple)
+        if: steps.signing.outputs.signed == 'false'
+        run: |
+          xcodebuild build \
+            -project AbogaRed.xcodeproj \
+            -scheme AbogaRed \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/AbogaRed.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: No se encontró $APP_PATH"
+            exit 1
+          fi
+
+          rm -rf build/ipa build/out
+          mkdir -p build/ipa/Payload build/out
+          cp -R "$APP_PATH" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../out/AbogaRed-unsigned.ipa Payload)
+          ls -lh build/out/AbogaRed-unsigned.ipa
+
+      - name: Compilar AbogaRed-signed.ipa (Con certificado Apple configurado en Secrets)
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.APPLE_EXPORT_METHOD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASS="abogared-ci-keychain"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+          METHOD="${EXPORT_METHOD:-development}"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${METHOD}</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.abogared.app</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild archive \
+            -project AbogaRed.xcodeproj \
+            -scheme AbogaRed \
+            -configuration Release \
+            -archivePath build/AbogaRed.xcarchive \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+
+          mkdir -p build/out
+          xcodebuild -exportArchive \
+            -archivePath build/AbogaRed.xcarchive \
+            -exportPath build/out \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+          if [ -f "build/out/AbogaRed.ipa" ]; then
+            mv build/out/AbogaRed.ipa build/out/AbogaRed-signed.ipa
+          fi
+          ls -lh build/out/*.ipa
+
+      - name: Subir artefacto .ipa descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: AbogaRed-iOS-IPA
+          path: build/out/*.ipa
+          retention-days: 90
+
+      - name: Publicar .ipa en GitHub Releases (opcional)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.2.{0}', github.run_number) }}
+          name: AbogaRed iOS ${{ format('v1.2.{0}', github.run_number) }}
+          files: build/out/*.ipa
+          generate_release_notes: true
