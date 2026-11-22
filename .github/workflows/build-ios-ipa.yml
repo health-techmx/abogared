@@ -13,6 +13,14 @@ on:
         options:
           - "false"
           - "true"
+      upload_testflight:
+        description: "Subir automáticamente a TestFlight / App Store Connect (si existen secrets ASC)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: write
@@ -36,21 +44,29 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep iphone
 
-      - name: Detectar configuración de firma Apple (opcional)
+      - name: Detectar configuración de firma Apple (App Store / Ad-Hoc)
         id: signing
         env:
           CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           CERT_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           PROFILE_B64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_BASE64 }}
         run: |
           if [ -n "$CERT_B64" ] && [ -n "$CERT_PASS" ] && [ -n "$PROFILE_B64" ] && [ -n "$TEAM_ID" ]; then
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
+          if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8_B64" ]; then
+            echo "has_asc=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_asc=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Compilar AbogaRed-unsigned.ipa (Modo 100% gratis sin cuenta Apple)
+      - name: Compilar AbogaRed-unsigned.ipa (Modo sin firma / Sideloadly)
         if: steps.signing.outputs.signed == 'false'
         run: |
           xcodebuild build \
@@ -76,7 +92,7 @@ jobs:
           (cd build/ipa && zip -qry ../out/AbogaRed-unsigned.ipa Payload)
           ls -lh build/out/AbogaRed-unsigned.ipa
 
-      - name: Compilar AbogaRed-signed.ipa (Con certificado Apple configurado en Secrets)
+      - name: Compilar AbogaRed-signed.ipa (Firmado oficial Apple Distribution)
         if: steps.signing.outputs.signed == 'true'
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -90,8 +106,8 @@ jobs:
           CERT_PATH="$RUNNER_TEMP/certificate.p12"
           PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
 
-          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
-          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | tr -d '[:space:]' | base64 --decode > "$CERT_PATH"
+          printf '%s' "$APPLE_PROVISIONING_PROFILE_BASE64" | tr -d '[:space:]' | base64 --decode > "$PROFILE_PATH"
 
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -100,41 +116,45 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
 
+          SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Apple Distribution|iPhone Distribution|Apple Development/{print $2; exit}')
+          if [ -z "$SIGNING_IDENTITY" ]; then
+            SIGNING_IDENTITY="Apple Distribution"
+          fi
+          echo "Usando identidad de firma: $SIGNING_IDENTITY"
+
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+          export PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
           cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
-          METHOD="${EXPORT_METHOD:-development}"
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>${METHOD}</string>
-            <key>teamID</key>
-            <string>${APPLE_TEAM_ID}</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>com.abogared.app</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
-          </dict>
-          </plist>
-          EOF
+          python3 - <<'PY'
+          import plistlib, os
+          opts = {
+              "method": (os.environ.get("EXPORT_METHOD") or "app-store-connect").strip(),
+              "teamID": os.environ["APPLE_TEAM_ID"].strip(),
+              "signingStyle": "manual",
+              "uploadSymbols": True,
+              "manageAppVersionAndBuildNumber": False,
+              "provisioningProfiles": {
+                  "com.abogared.app": os.environ["PROFILE_NAME"].strip(),
+              },
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "ExportOptions.plist"), "wb") as f:
+              plistlib.dump(opts, f)
+          PY
 
           xcodebuild archive \
             -project AbogaRed.xcodeproj \
             -scheme AbogaRed \
             -configuration Release \
             -archivePath build/AbogaRed.xcarchive \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
 
           mkdir -p build/out
           xcodebuild -exportArchive \
@@ -146,6 +166,25 @@ jobs:
             mv build/out/AbogaRed.ipa build/out/AbogaRed-signed.ipa
           fi
           ls -lh build/out/*.ipa
+
+      - name: Subir a TestFlight / App Store Connect
+        if: steps.signing.outputs.signed == 'true' && steps.signing.outputs.has_asc == 'true' && github.event.inputs.upload_testflight != 'false'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$ASC_KEY_P8_B64" | tr -d '[:space:]' | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+          IPA_FILE=$(ls build/out/*-signed.ipa build/out/*.ipa 2>/dev/null | head -n 1)
+          echo "Subiendo $IPA_FILE a App Store Connect / TestFlight..."
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_FILE" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
 
       - name: Subir artefacto .ipa descargable
         uses: actions/upload-artifact@v4

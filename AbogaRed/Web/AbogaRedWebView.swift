@@ -14,12 +14,23 @@ final class WebViewModel: ObservableObject {
     @Published var estimatedProgress: Double = 0.0
     @Published var isOffline = false
     @Published var showSplash = true
+    @Published var currentPath: String = "/"
+    @Published var unreadAlertsCount: Int = 0
     @Published var downloadedFile: IdentifiableURL?
     @Published var externalSafariLink: IdentifiableURL?
 
     weak var webView: WKWebView?
 
     static let homeURLString = AbogaRedNotificationManager.baseOrigin
+
+    var isAuthenticatedRoute: Bool {
+        let lower = currentPath.lowercased()
+        let guestPrefixes = ["/login", "/register", "/forgot-password", "/reset-password", "/verify-email", "/confirm-password", "/auth/"]
+        if lower == "/" || lower.isEmpty {
+            return false
+        }
+        return !guestPrefixes.contains { lower.hasPrefix($0) }
+    }
 
     func load(urlString: String) {
         let safe = AbogaRedNotificationManager.shared.sanitizeTargetUrl(urlString)
@@ -220,11 +231,19 @@ struct AbogaRedWebView: UIViewRepresentable {
                 if let token = data["token"] as? String, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     KeychainHelper.shared.save(value: token.trimmingCharacters(in: .whitespacesAndNewlines))
                     BackgroundAlertService.shared.scheduleNextRefresh()
+                    AbogaRedNotificationManager.shared.fetchAlertsForNativeUI { [weak self] result in
+                        if case .success(let items) = result {
+                            self?.viewModel.unreadAlertsCount = items.count
+                        }
+                    }
                 }
 
             case "clearAlertToken":
                 KeychainHelper.shared.delete()
                 BackgroundAlertService.shared.cancelScheduledRefresh()
+                DispatchQueue.main.async {
+                    self.viewModel.unreadAlertsCount = 0
+                }
 
             default:
                 break
@@ -239,11 +258,21 @@ struct AbogaRedWebView: UIViewRepresentable {
             }
         }
 
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            if let path = webView.url?.path, !path.isEmpty {
+                DispatchQueue.main.async {
+                    self.viewModel.currentPath = path
+                }
+            }
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            let path = webView.url?.path ?? "/"
             AbogaRedNotificationManager.shared.getPermissionStatus { [weak self] status in
                 self?.viewModel.pushPermissionStatusToWeb(status)
             }
             DispatchQueue.main.async {
+                self.viewModel.currentPath = path.isEmpty ? "/" : path
                 self.viewModel.isLoading = false
                 if self.viewModel.showSplash {
                     withAnimation(.easeOut(duration: 0.25)) {

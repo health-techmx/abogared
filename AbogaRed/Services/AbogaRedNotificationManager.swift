@@ -5,6 +5,32 @@ import UserNotifications
 extension Notification.Name {
     static let abogaRedOpenURL = Notification.Name("abogaRedOpenURL")
     static let abogaRedPermissionChanged = Notification.Name("abogaRedPermissionChanged")
+    static let abogaRedAlertsUpdated = Notification.Name("abogaRedAlertsUpdated")
+}
+
+struct MobileAlertItem: Identifiable {
+    let id: String
+    let notifyKey: String
+    let notifTitle: String
+    let notifBody: String
+    let titulo: String
+    let caseNumber: String
+    let client: String?
+    let fecha: String
+    let hora: String?
+    let badgeText: String
+    let urgency: String
+    let diffDays: Int
+    let urgent: Bool
+    let isHearing: Bool
+    let url: String
+}
+
+enum AlertsFetchError: Error {
+    case missingToken
+    case invalidEndpoint
+    case unauthorized
+    case networkFailed
 }
 
 final class AbogaRedNotificationManager: NSObject, UNUserNotificationCenterDelegate {
@@ -172,84 +198,142 @@ final class AbogaRedNotificationManager: NSObject, UNUserNotificationCenterDeleg
         return true
     }
 
-    func pollAlertsFromServer(completion: @escaping (Bool) -> Void) {
-        guard let token = KeychainHelper.shared.read(), !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            completion(true)
+    func fetchAlertsForNativeUI(completion: @escaping (Result<[MobileAlertItem], AlertsFetchError>) -> Void) {
+        guard let token = KeychainHelper.shared.read()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
+            DispatchQueue.main.async {
+                completion(.failure(.missingToken))
+            }
             return
         }
 
-        getPermissionStatus { [weak self] status in
-            guard let self = self, status == "granted" else {
-                completion(true)
+        guard let endpointURL = URL(string: Self.defaultAlertsEndpoint) else {
+            DispatchQueue.main.async {
+                completion(.failure(.invalidEndpoint))
+            }
+            return
+        }
+
+        var req = URLRequest(url: endpointURL)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(token, forHTTPHeaderField: "X-AbogaRed-Alert-Token")
+        req.setValue("AbogaRedApp/1.2 (iOS)", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+            if error != nil {
+                DispatchQueue.main.async {
+                    completion(.failure(.networkFailed))
+                }
+                return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                DispatchQueue.main.async {
+                    completion(.failure(.networkFailed))
+                }
+                return
+            }
+            if http.statusCode == 401 || http.statusCode == 403 {
+                KeychainHelper.shared.delete()
+                DispatchQueue.main.async {
+                    completion(.failure(.unauthorized))
+                }
+                return
+            }
+            guard (200...299).contains(http.statusCode), let data = data else {
+                DispatchQueue.main.async {
+                    completion(.failure(.networkFailed))
+                }
                 return
             }
 
-            guard let endpointURL = URL(string: Self.defaultAlertsEndpoint) else {
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rawAlerts = root["alerts"] as? [[String: Any]] else {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .abogaRedAlertsUpdated, object: 0)
+                    completion(.success([]))
+                }
+                return
+            }
+
+            let items: [MobileAlertItem] = rawAlerts.enumerated().map { idx, item in
+                let id = (item["id"] as? String) ?? "\(idx)"
+                let diffDays = (item["diff_days"] as? NSNumber)?.intValue ?? 99
+                let fechaIso = (item["fecha_iso"] as? String) ?? ""
+                let notifyKey = (item["notify_key"] as? String) ?? "\(id):\(fechaIso)"
+                let notifTitle = (item["notif_title"] as? String) ?? "AbogaRed · Alerta Legal"
+                let titulo = (item["titulo"] as? String) ?? "Diligencia próxima"
+                let notifBody = (item["notif_body"] as? String) ?? titulo
+                let caseNumber = (item["case_number"] as? String) ?? "Expediente"
+                let client = item["client"] as? String
+                let fecha = (item["fecha"] as? String) ?? fechaIso
+                let hora = item["hora"] as? String
+                let badgeText = (item["badge_text"] as? String) ?? ""
+                let urgency = (item["urgency"] as? String) ?? ""
+                let urgent = (item["urgent"] as? Bool) ?? (diffDays <= 1)
+                let isHearing = (item["is_hearing"] as? Bool) ?? false
+                let target = self?.sanitizeTargetUrl(item["url"] as? String) ?? (Self.baseOrigin + "/calendario")
+
+                return MobileAlertItem(
+                    id: id,
+                    notifyKey: notifyKey,
+                    notifTitle: notifTitle,
+                    notifBody: notifBody,
+                    titulo: titulo,
+                    caseNumber: caseNumber,
+                    client: client,
+                    fecha: fecha,
+                    hora: hora,
+                    badgeText: badgeText,
+                    urgency: urgency,
+                    diffDays: diffDays,
+                    urgent: urgent,
+                    isHearing: isHearing,
+                    url: target
+                )
+            }
+
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .abogaRedAlertsUpdated, object: items.count)
+                completion(.success(items))
+            }
+        }.resume()
+    }
+
+    func pollAlertsFromServer(completion: @escaping (Bool) -> Void) {
+        fetchAlertsForNativeUI { [weak self] result in
+            guard let self = self else {
                 completion(false)
                 return
             }
-
-            var req = URLRequest(url: endpointURL)
-            req.httpMethod = "GET"
-            req.timeoutInterval = 15
-            req.setValue("application/json", forHTTPHeaderField: "Accept")
-            req.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-AbogaRed-Alert-Token")
-            req.setValue("AbogaRedApp/1.2 (iOS)", forHTTPHeaderField: "User-Agent")
-
-            URLSession.shared.dataTask(with: req) { data, response, error in
-                if error != nil {
-                    completion(false)
-                    return
-                }
-                guard let http = response as? HTTPURLResponse else {
-                    completion(false)
-                    return
-                }
-                if http.statusCode == 401 || http.statusCode == 403 {
-                    KeychainHelper.shared.delete()
-                    completion(true)
-                    return
-                }
-                guard (200...299).contains(http.statusCode), let data = data else {
-                    completion(false)
-                    return
-                }
-
-                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let alerts = root["alerts"] as? [[String: Any]] else {
-                    completion(true)
-                    return
-                }
-
-                var shown = 0
-                for (idx, item) in alerts.enumerated() {
-                    if shown >= 5 { break }
-                    let diffDays = (item["diff_days"] as? NSNumber)?.intValue ?? 99
-                    if diffDays > 3 { continue }
-
-                    let id = (item["id"] as? String) ?? "\(idx)"
-                    let fechaIso = (item["fecha_iso"] as? String) ?? ""
-                    let notifyKey = (item["notify_key"] as? String) ?? "\(id):\(fechaIso)"
-                    let title = (item["notif_title"] as? String) ?? "AbogaRed · Alerta Legal"
-                    let body = (item["notif_body"] as? String) ?? (item["titulo"] as? String) ?? "Diligencia próxima"
-                    let url = item["url"] as? String
-                    let urgent = (item["urgent"] as? Bool) ?? (diffDays <= 1)
-
-                    if self.showAlertNotification(
-                        alertId: id,
-                        notifyKey: notifyKey,
-                        title: title,
-                        body: body,
-                        url: url,
-                        urgent: urgent,
-                        forceShow: false
-                    ) {
-                        shown += 1
+            switch result {
+            case .failure(let err):
+                completion(err == .missingToken || err == .unauthorized)
+            case .success(let items):
+                self.getPermissionStatus { status in
+                    guard status == "granted" else {
+                        completion(true)
+                        return
                     }
+                    var shown = 0
+                    for item in items where item.diffDays <= 3 {
+                        if shown >= 5 { break }
+                        if self.showAlertNotification(
+                            alertId: item.id,
+                            notifyKey: item.notifyKey,
+                            title: item.notifTitle,
+                            body: item.notifBody,
+                            url: item.url,
+                            urgent: item.urgent,
+                            forceShow: false
+                        ) {
+                            shown += 1
+                        }
+                    }
+                    completion(true)
                 }
-
-                completion(true)
-            }.resume()
+            }
         }
     }
 
